@@ -1,0 +1,315 @@
+import { createClient } from "npm:@supabase/supabase-js@2";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const N8N_URL = Deno.env.get("N8N_WEBHOOK_URL") || "";
+const EVOLUTION_URL = (Deno.env.get("EVOLUTION_API_URL") || "").replace(/\/+$/, "");
+const EVOLUTION_KEY = Deno.env.get("EVOLUTION_API_KEY") || "";
+
+const admin = createClient(SUPABASE_URL, SERVICE_KEY);
+const ok = (data: Record<string, unknown>) =>
+  new Response(JSON.stringify(data), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+
+const normalizePhone = (jid = "") => jid.split("@")[0]?.replace(/\D/g, "") || "unknown";
+const isGroupJid = (jid = "") => jid.endsWith("@g.us");
+const isIndividualJid = (jid = "") => jid.endsWith("@s.whatsapp.net") && /^[1-9][0-9]{7,14}$/.test(normalizePhone(jid));
+
+function detectKind(message: any): { kind: string; text: string } {
+  if (!message) return { kind: "text", text: "" };
+  const text =
+    message.conversation ||
+    message.extendedTextMessage?.text ||
+    message.imageMessage?.caption ||
+    message.videoMessage?.caption ||
+    "";
+  if (message.audioMessage) return { kind: "audio", text };
+  if (message.imageMessage) return { kind: "image", text };
+  if (message.videoMessage) return { kind: "video", text };
+  if (message.documentMessage) return { kind: "document", text };
+  if (message.stickerMessage) return { kind: "sticker", text: "" };
+  if (message.locationMessage) return { kind: "location", text: "[Localização]" };
+  if (message.contactMessage) return { kind: "contact", text: "[Contato]" };
+  return { kind: "text", text };
+}
+
+async function fetchAudioBase64(instance: string, messageKey: any): Promise<string | null> {
+  if (!EVOLUTION_URL || !EVOLUTION_KEY || !messageKey) return null;
+  try {
+    const r = await fetch(`${EVOLUTION_URL}/chat/getBase64FromMediaMessage/${instance}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: EVOLUTION_KEY },
+      body: JSON.stringify({ message: { key: messageKey } }),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return j?.base64 || null;
+  } catch {
+    return null;
+  }
+}
+
+async function persistMedia(instance: string, messageKey: any, userId: string, kind: string) {
+  if (!EVOLUTION_URL || !EVOLUTION_KEY || !messageKey || !["image", "audio", "video", "document"].includes(kind)) return null;
+  try {
+    const response = await fetch(`${EVOLUTION_URL}/chat/getBase64FromMediaMessage/${encodeURIComponent(instance)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: EVOLUTION_KEY },
+      body: JSON.stringify({ message: { key: messageKey }, convertToMp4: kind === "video" }),
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const base64 = String(payload?.base64 || "").replace(/^data:[^;]+;base64,/, "");
+    if (!base64) return null;
+    const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    const extension = kind === "image" ? "jpg" : kind === "audio" ? "ogg" : kind === "video" ? "mp4" : "bin";
+    const path = `${userId}/inbox/${messageKey.id}-${Date.now()}.${extension}`;
+    const contentType = kind === "image" ? "image/jpeg" : kind === "audio" ? "audio/ogg" : kind === "video" ? "video/mp4" : "application/octet-stream";
+    const upload = await admin.storage.from("store-assets").upload(path, bytes, { contentType, upsert: true });
+    if (upload.error) return null;
+    return admin.storage.from("store-assets").getPublicUrl(path).data.publicUrl;
+  } catch {
+    return null;
+  }
+}
+
+async function saveHistory(userId: string, phoneNumber: string, role: "user" | "assistant", content: string, metadata: Record<string, unknown> = {}) {
+  if (!content) return;
+  await admin.from("n8n_chat_histories").insert({
+    user_id: userId,
+    phone_number: phoneNumber,
+    session_id: `${userId}_${phoneNumber}`,
+    message: { type: role, data: { content, ...metadata } },
+  });
+}
+
+async function dispatchToN8n(payload: any) {
+  if (!N8N_URL) {
+    console.warn("N8N_WEBHOOK_URL not configured");
+    return false;
+  }
+  try {
+    const res = await fetch(N8N_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    return res.ok;
+  } catch (e) {
+    console.error("n8n dispatch error", e);
+    return false;
+  }
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+  try {
+    const body = await req.json().catch(() => ({}));
+    const event = (body?.event || "").toString().toLowerCase().replace(/[._-]/g, "");
+    const instanceName = body?.instance || body?.instanceName || body?.data?.instanceName;
+    if (!instanceName) return ok({ ok: true, ignored: true });
+
+    const { data: inst } = await admin
+      .from("instances")
+      .select("user_id, phone, automation_paused, automation_paused_until")
+      .eq("instance_name", instanceName)
+      .maybeSingle();
+    if (!inst) return ok({ ok: true, no_instance: true });
+    const userId = inst.user_id as string;
+    // Auto-resume if pause timer expired
+    if (inst.automation_paused && inst.automation_paused_until && new Date(inst.automation_paused_until).getTime() <= Date.now()) {
+      await admin.from("instances").update({ automation_paused: false, automation_paused_until: null }).eq("instance_name", instanceName);
+      inst.automation_paused = false;
+    }
+
+    if (event === "connectionupdate") {
+      const state = body?.data?.state || body?.state;
+      const mapped = state === "open" ? "connected" : state === "connecting" ? "connecting" : "disconnected";
+      const updates: any = { connection_state: mapped, evolution_state: state, status: mapped };
+      const wuid = body?.data?.wuid || body?.data?.ownerJid;
+      if (wuid) {
+        const phoneNum = normalizePhone(wuid);
+        updates.phone = phoneNum;
+        updates.phone_number = phoneNum;
+      }
+      if (mapped === "connected") updates.last_connected_at = new Date().toISOString();
+      await admin.from("instances").update(updates).eq("instance_name", instanceName);
+    }
+
+    if (event === "presenceupdate") {
+      const presence = body?.data?.presences?.[0] || body?.data;
+      const phoneNumber = normalizePhone(presence?.id || presence?.remoteJid || presence?.jid || "");
+      const rawState = String(presence?.lastKnownPresence || presence?.presence || presence?.state || "offline").toLowerCase();
+      const state = rawState.includes("record") ? "recording" : rawState.includes("compos") ? "typing" : rawState === "available" || rawState === "online" ? "online" : "offline";
+      if (phoneNumber) await admin.from("inbox_contact_presence").upsert({ user_id: userId, phone_number: phoneNumber, state, updated_at: new Date().toISOString() });
+    }
+
+    if (event === "messagesupdate") {
+      const updates = Array.isArray(body?.data) ? body.data : [body?.data];
+      for (const update of updates) {
+        const externalId = update?.key?.id || update?.id;
+        const rawStatus = String(update?.update?.status || update?.status || "").toLowerCase();
+        const deliveryStatus = rawStatus.includes("read") ? "read" : rawStatus.includes("deliver") ? "delivered" : rawStatus.includes("fail") ? "failed" : rawStatus.includes("server") || rawStatus.includes("sent") ? "sent" : null;
+        if (externalId && deliveryStatus) await admin.from("messages").update({ delivery_status: deliveryStatus, read_at: deliveryStatus === "read" ? new Date().toISOString() : null }).eq("user_id", userId).eq("external_id", externalId);
+      }
+    }
+
+    if (event === "messagesupsert") {
+      const messages = body?.data?.messages || (body?.data ? [body.data] : []);
+      const arr = Array.isArray(messages) ? messages : [messages];
+      for (const m of arr) {
+        if (!m || m?.key?.fromMe === true) continue;
+        const remote = m?.key?.remoteJid || "";
+        const isGroup = isGroupJid(remote);
+        const phoneNumber = isGroup ? remote : normalizePhone(remote);
+        const pushName = m?.pushName || m?.verifiedBizName || null;
+        const { kind, text } = detectKind(m?.message);
+        if (!isGroup && !isIndividualJid(remote)) continue;
+        const mediaUrl = await persistMedia(instanceName, m?.key, userId, kind);
+
+        await admin.from("whatsapp_contacts").upsert(
+          {
+            user_id: userId,
+            instance_name: instanceName,
+            remote_jid: remote,
+            is_group: isGroup,
+            phone_number: phoneNumber,
+            name: pushName,
+            last_message_at: new Date().toISOString(),
+          },
+          { onConflict: "user_id,instance_name,phone_number" },
+        );
+
+        // Save inbound message immediately (for history regardless of automation)
+        const messagePayload = {
+          user_id: userId,
+          phone_number: phoneNumber,
+          message_text: text.substring(0, 4000),
+          direction: "inbound",
+          kind,
+          media_url: mediaUrl,
+          whatsapp_instance_id: instanceName,
+          external_id: m?.key?.id || null,
+          remote_jid: remote,
+          mime_type: m?.message?.audioMessage?.mimetype || m?.message?.imageMessage?.mimetype || m?.message?.videoMessage?.mimetype || m?.message?.documentMessage?.mimetype || null,
+          file_name: m?.message?.documentMessage?.fileName || null,
+          is_voice_note: kind === "audio" && Boolean(m?.message?.audioMessage?.ptt),
+          media_metadata: { remote_jid: remote, message_id: m?.key?.id || null, push_name: pushName },
+        };
+        const { data: existingMessage } = await admin.from("messages").select("id").eq("user_id", userId).eq("external_id", m?.key?.id || "").maybeSingle();
+        if (!existingMessage && m?.key?.id) await admin.from("messages").insert(messagePayload);
+        await saveHistory(userId, phoneNumber, "user", text || `[${kind}]`, { kind, media_url: mediaUrl, external_id: m?.key?.id || null, is_group: isGroup });
+
+        // Group messages belong to Inbox only. They must never enter the AI pipeline.
+        if (isGroup) continue;
+
+        if (inst.automation_paused === true) continue;
+
+        const { data: blocked } = await admin
+          .from("blocked_contacts")
+          .select("id")
+          .eq("user_id", userId)
+          .eq("phone_number", phoneNumber)
+          .eq("is_active", true)
+          .maybeSingle();
+        if (blocked) continue;
+
+        const { data: contact } = await admin
+          .from("whatsapp_contacts")
+          .select("id,should_respond")
+          .eq("user_id", userId)
+          .eq("phone_number", phoneNumber)
+          .maybeSingle();
+        if (contact?.should_respond === false) continue;
+        const { data: conversation } = await admin
+          .from("inbox_conversations")
+          .select("status,response_mode")
+          .eq("user_id", userId)
+          .eq("contact_id", contact?.id || "")
+          .maybeSingle();
+        if (conversation?.response_mode === "human" || conversation?.status === "human") continue;
+
+        // Check credits before dispatching to n8n
+        const { data: profile } = await admin
+          .from("profiles")
+          .select("messages_received, message_limit, business_name, business_description, ai_name, ai_rules")
+          .eq("user_id", userId)
+          .maybeSingle();
+        const limit = Number(profile?.message_limit || 0);
+        const used = Number(profile?.messages_received || 0);
+        if (limit - used <= 0) {
+          await admin.from("instances").update({ automation_paused: true }).eq("instance_name", instanceName);
+          await admin.from("notifications").insert({
+            user_id: userId,
+            title: "Mensagens esgotadas",
+            message: "A automação foi pausada. Recarregue para reativar.",
+            type: "credits_empty",
+            link: "/recargas",
+          });
+          continue;
+        }
+
+        // Build n8n payload
+        const audioBase64 = kind === "audio" ? await fetchAudioBase64(instanceName, m?.key) : null;
+
+        const systemPrompt = [
+          profile?.business_name ? `Empresa: ${profile.business_name}` : "",
+          profile?.business_description ? `Sobre: ${profile.business_description}` : "",
+          profile?.ai_name ? `Você é ${profile.ai_name}, atendente virtual.` : "",
+          profile?.ai_rules ? `Regras:\n${profile.ai_rules}` : "",
+        ].filter(Boolean).join("\n\n");
+
+        const payload = {
+          metadata: {
+            instance_name: instanceName,
+            remote_jid: remote,
+            customer_name: pushName,
+            customer_phone: phoneNumber,
+            message_type: kind,
+            message_id: m?.key?.id,
+            user_id: userId,
+            callback_url: `${SUPABASE_URL}/functions/v1/n8n-callback`,
+            callback_secret: Deno.env.get("N8N_CALLBACK_SECRET") || "",
+          },
+          message_data: {
+            content: text,
+            media_url: mediaUrl,
+            media_base64: audioBase64,
+          },
+          business_logic: {
+            system_prompt: systemPrompt,
+            messages_remaining: limit - used,
+          },
+        };
+
+        // Enqueue (for safety) and fire-and-forget to n8n
+        const { data: queued } = await admin
+          .from("message_queue")
+          .insert({
+            user_id: userId,
+            instance_name: instanceName,
+            remote_jid: remote,
+            payload,
+            status: "processing",
+          })
+          .select("id")
+          .single();
+
+        const sent = await dispatchToN8n({ ...payload, metadata: { ...payload.metadata, queue_id: queued?.id } });
+        if (!sent && queued?.id) {
+          await admin.from("message_queue").update({ status: "pending", last_error: "dispatch_failed" }).eq("id", queued.id);
+        }
+      }
+    }
+
+    return ok({ ok: true });
+  } catch (e: any) {
+    console.error("webhook error", e);
+    return ok({ error: e?.message || "internal" });
+  }
+});

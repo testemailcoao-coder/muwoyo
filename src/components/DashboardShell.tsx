@@ -4,7 +4,6 @@ import {
   ChartArea,
   Building2,
   Menu,
-  Settings,
   Store,
   Gift,
   ShoppingBag,
@@ -46,8 +45,6 @@ const items = [
   { title: "Afiliados", to: "/afiliados", icon: Gift },
   { title: "Pagamentos", to: "/recargas", icon: CreditCard },
   { title: "Faturação", to: "/faturacao", icon: Wallet },
-  { title: "Definições", to: "/definicoes", icon: Settings },
-  { title: "Atendentes", to: "/equipa", icon: UsersRound, ownerOnly: true },
   { title: "Tutorial", to: "/tutorial", icon: PlayCircle },
 ];
 

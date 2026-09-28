@@ -58,12 +58,12 @@ Deno.serve(async (req) => {
     if (!instanceName || !["open", "connected"].includes(String(instanceRow?.connection_state || instanceRow?.status))) {
       return json({ error: "whatsapp_disconnected" }, 409);
     }
-    const { data: contact } = await admin.from("whatsapp_contacts").select("id").eq("user_id", userId).eq("phone_number", targetPhone).maybeSingle();
+    const { data: contact } = await admin.from("whatsapp_contacts").select("id").eq("user_id", userId).eq("instance_name", instanceName).eq("phone_number", targetPhone).maybeSingle();
     if (!contact) return json({ error: "contact_not_owned" }, 403);
     const { data: targetContact } = await admin.from("whatsapp_contacts").select("is_group,remote_jid").eq("id", contact.id).maybeSingle();
     if (targetContact?.is_group || String(targetContact?.remote_jid || "").endsWith("@g.us")) return json({ error: "group_messages_not_allowed" }, 403);
     if (actorMember?.role === "attendant") {
-      const { data: conversation } = await admin.from("inbox_conversations").select("assigned_to").eq("user_id", userId).eq("contact_id", contact.id).maybeSingle();
+      const { data: conversation } = await admin.from("inbox_conversations").select("assigned_to").eq("user_id", userId).eq("instance_name", instanceName).eq("contact_id", contact.id).maybeSingle();
       if (conversation?.assigned_to !== actorUserId) return json({ error: "conversation_not_assigned" }, 403);
     }
 

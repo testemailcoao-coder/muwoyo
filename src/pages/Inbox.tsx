@@ -96,9 +96,6 @@ export default function Inbox() {
   const [mediaCaption, setMediaCaption] = useState("");
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
-  const [groupOpen, setGroupOpen] = useState(false);
-  const [groupSubject, setGroupSubject] = useState("");
-  const [groupParticipants, setGroupParticipants] = useState<string[]>([]);
   const [recording, setRecording] = useState(false);
   const [recordingPaused, setRecordingPaused] = useState(false);
   const [recordingPreviewUrl, setRecordingPreviewUrl] = useState<string | null>(
@@ -134,7 +131,13 @@ export default function Inbox() {
         .eq("user_id", ownerUserId)
         .eq("instance_name", instanceName),
     ]);
-    const contactMap = new Map(
+    const contactMap = new Map<string, {
+      id: string;
+      name: string | null;
+      phone_number: string;
+      is_group?: boolean;
+      profile_picture_url?: string | null;
+    }>(
       (contacts || []).map(
         (contact: {
           id: string;
@@ -145,10 +148,15 @@ export default function Inbox() {
       ),
     );
     setConversations(
-      (rows || []).map((row: Conversation) => ({
-        ...row,
-        contact: contactMap.get(row.contact_id),
-      })),
+      (rows || [])
+        .filter((row: Conversation) => {
+          const contact = contactMap.get(row.contact_id);
+          return Boolean(contact && !contact.is_group && !String(contact.phone_number || "").includes("@"));
+        })
+        .map((row: Conversation) => ({
+          ...row,
+          contact: contactMap.get(row.contact_id),
+        })),
     );
   };
 
@@ -375,7 +383,6 @@ export default function Inbox() {
 
   const toggleAi = async () => {
     if (!selected || !user || !ownerUserId) return;
-    if (selected.is_group) return toast({ title: "A IA não responde a grupos", description: "Grupos ficam disponíveis apenas no Inbox." });
     const nextMode = selected.response_mode === "human" ? "ai" : "human";
     const { error } = await db
       .from("inbox_conversations")
@@ -414,7 +421,7 @@ export default function Inbox() {
         ? await db
             .from("appointments")
             .insert({
-              user_id: user.id,
+              user_id: ownerUserId,
               customer_name: selected.contact.name,
               customer_phone: selected.contact.phone_number,
               service: quickForm.service || "Atendimento",
@@ -428,7 +435,7 @@ export default function Inbox() {
         : await db
             .from("store_orders")
             .insert({
-              user_id: user.id,
+              user_id: ownerUserId,
               customer_name: selected.contact.name,
               customer_phone: selected.contact.phone_number,
               customer_location: quickForm.location || null,
@@ -563,14 +570,6 @@ export default function Inbox() {
     if (error) return toast({ title: "Ação não concluída", description: error.message, variant: "destructive" });
     if (action === "delete") { setSelected(null); selectedRef.current = null; }
     await load();
-  };
-
-  const createGroup = async () => {
-    if (!activeInstance || !groupSubject.trim() || groupParticipants.length < 1) return;
-    const { error } = await supabase.functions.invoke("inbox-actions", { body: { action: "create_group", instanceName: activeInstance, subject: groupSubject, participants: groupParticipants } });
-    if (error) return toast({ title: "Não foi possível criar o grupo", description: error.message, variant: "destructive" });
-    setGroupOpen(false); setGroupSubject(""); setGroupParticipants([]); toast({ title: "Grupo criado" });
-    await syncInbox(); await load();
   };
 
   if (loading)
@@ -1037,18 +1036,11 @@ export default function Inbox() {
                 >
                   Agendar
                 </Button>
-                <Button variant="outline" onClick={() => { setProfileOpen(false); setGroupOpen(true); }}>Criar grupo</Button>
               </div>
             </div>
           </DialogContent>
         </Dialog>
       )}
-      <Dialog open={groupOpen} onOpenChange={setGroupOpen}>
-        <DialogContent>
-          <DialogHeader><DialogTitle>Criar grupo WhatsApp</DialogTitle></DialogHeader>
-          <div className="space-y-3"><Input placeholder="Nome do grupo" value={groupSubject} onChange={(event) => setGroupSubject(event.target.value)} /><div className="max-h-56 overflow-y-auto rounded border p-2">{conversations.map((conversation) => { const phone = conversation.contact?.phone_number || ""; return <label key={conversation.id} className="flex items-center gap-2 border-b py-2 text-sm last:border-0"><input type="checkbox" checked={groupParticipants.includes(phone)} onChange={(event) => setGroupParticipants(event.target.checked ? [...groupParticipants, phone] : groupParticipants.filter((item) => item !== phone))} />{conversation.contact?.name || phone}</label>; })}</div><Button onClick={() => void createGroup()}>Criar grupo</Button></div>
-        </DialogContent>
-      </Dialog>
       <Dialog
         open={Boolean(quickAction)}
         onOpenChange={(open) => !open && setQuickAction(null)}

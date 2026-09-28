@@ -25,6 +25,7 @@ Deno.serve(async (req) => {
     if (!instance) return json({ error: "instance_not_owned" }, 403);
     const { data: contact } = await admin.from("whatsapp_contacts").select("id,remote_jid,is_group").eq("user_id", auth.user.id).eq("instance_name", instanceName).eq("phone_number", phone).maybeSingle();
     if (!contact && action !== "create_group") return json({ error: "contact_not_found" }, 404);
+    if (action === "create_group") return json({ error: "groups_not_allowed" }, 403);
     const jid = contact?.remote_jid || `${phone}@s.whatsapp.net`;
 
     if (action === "archive") {
@@ -42,13 +43,6 @@ Deno.serve(async (req) => {
       await admin.from("inbox_conversations").delete().eq("user_id", auth.user.id).eq("instance_name", instanceName).eq("contact_id", contact!.id);
       await admin.from("messages").delete().eq("user_id", auth.user.id).eq("whatsapp_instance_id", instanceName).eq("phone_number", phone);
       return json({ ok: true });
-    }
-    if (action === "create_group") {
-      const numbers = Array.isArray(body.participants) ? body.participants.map(String).filter(Boolean) : [];
-      if (!String(body.subject || "").trim() || numbers.length < 1) return json({ error: "subject_and_participants_required" }, 400);
-      const response = await evo(`/group/create/${encodeURIComponent(instanceName)}`, { subject: String(body.subject).trim(), participants: numbers });
-      if (!response.ok) return json({ error: "group_create_failed" }, 502);
-      return json({ ok: true, data: await response.json().catch(() => null) });
     }
     return json({ error: "unknown_action" }, 400);
   } catch (error) { console.error("inbox-actions", error); return json({ error: error instanceof Error ? error.message : "internal" }, 500); }

@@ -46,6 +46,11 @@ const getStoredInstanceName = async (admin: ReturnType<typeof createClient>, use
   return (row?.instance_name as string | undefined) || null;
 };
 
+const startTrialIfNeeded = async (admin: ReturnType<typeof createClient>, userId: string) => {
+  const { error } = await admin.rpc("start_trial_on_whatsapp_connection", { p_user_id: userId });
+  if (error) console.error("Could not start WhatsApp trial", error);
+};
+
 // Upsert instance row (creates if missing, updates if exists). Used after successful evolution operations.
 const saveInstance = async (
   admin: ReturnType<typeof createClient>,
@@ -53,15 +58,11 @@ const saveInstance = async (
   instanceName: string,
   patch: Record<string, any>,
 ) => {
-  await admin.from("instances").upsert(
+  const { error } = await admin.from("instances").upsert(
     { user_id: userId, instance_name: instanceName, ...patch },
-    { onConflict: "instance_name" },
+    { onConflict: "user_id" },
   );
-
-  const startTrialIfNeeded = async (admin: ReturnType<typeof createClient>, userId: string) => {
-    const { error } = await admin.rpc("start_trial_on_whatsapp_connection", { p_user_id: userId });
-    if (error) console.error("Could not start WhatsApp trial", error);
-  };
+  if (error) throw error;
 };
 
 // CHECK DIRECTLY ON EVOLUTION (do NOT trust supabase)
@@ -91,8 +92,26 @@ const createEvolutionInstance = async (instanceName: string, phone?: string) => 
         url: WEBHOOK_URL,
         byEvents: false,
         base64: true,
-        events: ["MESSAGES_UPSERT", "MESSAGES_UPDATE", "CONNECTION_UPDATE", "QRCODE_UPDATED"],
+        events: [
+          "CONNECTION_UPDATE",
+          "QRCODE_UPDATED",
+          "MESSAGES_SET",
+          "MESSAGES_UPSERT",
+          "MESSAGES_UPDATE",
+          "MESSAGES_DELETE",
+          "SEND_MESSAGE",
+          "SEND_MESSAGE_UPDATE",
+          "CONTACTS_SET",
+          "CONTACTS_UPSERT",
+          "CONTACTS_UPDATE",
+          "CHATS_SET",
+          "CHATS_UPSERT",
+          "CHATS_UPDATE",
+          "CHATS_DELETE",
+          "PRESENCE_UPDATE",
+        ],
       },
+      syncFullHistory: true,
     }),
   });
 };
@@ -127,10 +146,9 @@ Deno.serve(async (req) => {
 
     if (!normalizedAction) return json({ error: "missing_action" }, 400);
 
-    // Reuse the user's permanent instance_name forever. Only use frontend-generated
-    // Muwoyo_XXXXXX when the user has no stored instance yet.
+    // The stored instance is authoritative after the first connection.
     const storedInstanceName = await getStoredInstanceName(admin, userId);
-    const instanceName = requestedInstanceName || storedInstanceName;
+    const instanceName = storedInstanceName || requestedInstanceName;
     if (!instanceName) {
       return json({ error: "instance_name_required", message: "Frontend deve enviar instanceName" }, 400);
     }

@@ -107,13 +107,21 @@ Deno.serve(async (req) => {
     for (const chat of valueArray(chatsResponse.data)) {
       const jid = remoteJid(chat);
       const isGroup = jid.endsWith("@g.us");
-      const phone = isGroup ? jid : normalizePhone(jid);
-      if (!phone || jid.includes("@broadcast")) continue;
-      if (!isGroup && (!jid.endsWith("@s.whatsapp.net") || !isValidIndividualPhone(phone))) continue;
+      if (isGroup || jid.includes("@broadcast")) continue;
+      const phone = normalizePhone(jid);
+      if (!phone || !jid.endsWith("@s.whatsapp.net") || !isValidIndividualPhone(phone)) continue;
       const profile = contactsByPhone.get(phone);
-      const name = chat?.name || chat?.pushName || profile?.pushName || profile?.name || profile?.notify || null;
+      const incomingName = profile?.pushName || profile?.name || profile?.notify || profile?.verifiedBizName || null;
       const profilePictureUrl = chat?.profilePictureUrl || chat?.profilePicUrl || profile?.profilePictureUrl || profile?.profilePicUrl || await fetchProfilePicture(instanceName, phone);
       const lastMessageAt = chat?.conversationTimestamp ? new Date(Number(chat.conversationTimestamp) * 1000).toISOString() : chat?.updatedAt || new Date().toISOString();
+      const { data: existingContact } = await admin
+        .from("whatsapp_contacts")
+        .select("id,name")
+        .eq("user_id", userId)
+        .eq("instance_name", instanceName)
+        .eq("phone_number", phone)
+        .maybeSingle();
+      const name = incomingName || existingContact?.name || null;
       const { data: contact } = await admin.from("whatsapp_contacts").upsert({ user_id: userId, instance_name: instanceName, remote_jid: jid, is_group: isGroup, phone_number: phone, name, profile_picture_url: profilePictureUrl, last_message_at: lastMessageAt }, { onConflict: "user_id,instance_name,phone_number" }).select("id").single();
       if (!contact?.id) continue;
       await admin.from("inbox_conversations").upsert({ user_id: userId, instance_name: instanceName, contact_id: contact.id, last_message_at: lastMessageAt }, { onConflict: "user_id,instance_name,contact_id", ignoreDuplicates: false });

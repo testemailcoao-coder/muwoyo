@@ -54,11 +54,15 @@ export default function CRM() {
   const [saving, setSaving] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
   const [manualContact, setManualContact] = useState({ name: "", phone_number: "" });
+  const [activeInstance, setActiveInstance] = useState<{ id: string; instance_name: string } | null>(null);
 
   const load = async () => {
     if (!user) return;
+    const { data: instance } = await db.from("instances").select("id,instance_name").eq("user_id", user.id).eq("status", "connected").order("created_at", { ascending: false }).limit(1).maybeSingle();
+    setActiveInstance(instance || null);
+    if (!instance) { setContacts([]); setStages([]); setTags([]); return; }
     const [{ data: contactRows }, { data: stageRows }, { data: tagRows }, { data: metadataRows }, { data: tagLinks }] = await Promise.all([
-      db.from("whatsapp_contacts").select("id,name,phone_number,last_message_at,created_at,is_group").eq("user_id", user.id).eq("is_group", false).order("last_message_at", { ascending: false, nullsFirst: false }),
+      db.from("whatsapp_contacts").select("id,name,phone_number,last_message_at,created_at,is_group").eq("user_id", user.id).eq("whatsapp_instance_id", instance.id).eq("is_group", false).order("last_message_at", { ascending: false, nullsFirst: false }),
       db.from("crm_stages").select("id,name,position").eq("user_id", user.id).order("position"),
       db.from("crm_tags").select("id,name").eq("user_id", user.id).order("name"),
       db.from("crm_contact_metadata").select("contact_id,stage_id,owner_id,notes").eq("user_id", user.id),
@@ -131,7 +135,8 @@ export default function CRM() {
   const addManualContact = async () => {
     if (!user || !manualContact.phone_number.trim()) return;
     const phone = manualContact.phone_number.replace(/\D/g, "");
-    const { data, error } = await db.from("whatsapp_contacts").upsert({ user_id: user.id, name: manualContact.name.trim() || null, phone_number: phone, should_respond: true }, { onConflict: "user_id,phone_number", ignoreDuplicates: false }).select("id").single();
+    if (!activeInstance) return toast({ title: "WhatsApp não conectado", description: "Conecte um WhatsApp antes de adicionar contactos.", variant: "destructive" });
+    const { data, error } = await db.from("whatsapp_contacts").upsert({ user_id: user.id, instance_name: activeInstance.instance_name, whatsapp_instance_id: activeInstance.id, canonical_remote_jid: `${phone}@s.whatsapp.net`, remote_jid: `${phone}@s.whatsapp.net`, identity_type: "phone", identity_status: "resolved", name: manualContact.name.trim() || null, phone_number: phone, should_respond: true }, { onConflict: "whatsapp_instance_id,canonical_remote_jid", ignoreDuplicates: false }).select("id").single();
     if (error) return toast({ title: "Não foi possível guardar o contacto", description: error.message, variant: "destructive" });
     await db.from("crm_activities").insert({ user_id: user.id, contact_id: data.id, activity_type: "contact_created", description: "Contacto adicionado manualmente" });
     setManualContact({ name: "", phone_number: "" });

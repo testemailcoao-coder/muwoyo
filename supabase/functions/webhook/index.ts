@@ -159,38 +159,65 @@ Deno.serve(async (req) => {
       }
     }
 
-    if (event === "messagesupsert") {
-      const messages = body?.data?.messages || (body?.data ? [body.data] : []);
+    if (event === "messagesset") {
+      const progress = body?.data?.progress ?? body?.progress ?? null;
+      const isLatest = body?.data?.isLatest === true || body?.isLatest === true;
+      const now = new Date().toISOString();
+      await admin.from("instances").update({
+        history_sync_status: isLatest ? "completed" : "syncing",
+        history_sync_progress: isLatest ? 100 : Math.max(0, Math.min(100, Number(progress || 0))),
+        history_sync_started_at: isLatest ? null : now,
+        history_sync_completed_at: isLatest ? now : null,
+        last_sync_at: isLatest ? now : null,
+      }).eq("instance_name", instanceName);
+      console.log(JSON.stringify({ event: "MESSAGES_SET", instanceName, progress, isLatest }));
+    }
+
+    if (event === "messagesupsert" || event === "messagesset" || event === "sendmessage") {
+      const messages = body?.data?.messages || (Array.isArray(body?.data) ? body.data : body?.data ? [body.data] : []);
       const arr = Array.isArray(messages) ? messages : [messages];
       for (const m of arr) {
-        if (!m || m?.key?.fromMe === true) continue;
+        if (!m) continue;
         const remote = m?.key?.remoteJid || "";
         const isGroup = isGroupJid(remote);
-        const phoneNumber = isGroup ? remote : normalizePhone(remote);
-        const pushName = m?.pushName || m?.verifiedBizName || null;
+        if (isGroup) continue;
+        const phoneNumber = normalizePhone(remote);
+        const fromMe = m?.key?.fromMe === true || m?.fromMe === true;
+        const pushName = fromMe ? null : m?.pushName || m?.verifiedBizName || null;
         const { kind, text } = detectKind(m?.message);
         if (!isGroup && !isIndividualJid(remote)) continue;
         const mediaUrl = await persistMedia(instanceName, m?.key, userId, kind);
 
-        await admin.from("whatsapp_contacts").upsert(
-          {
+        const { data: existingContact } = await admin
+          .from("whatsapp_contacts")
+          .select("id,name")
+          .eq("user_id", userId)
+          .eq("instance_name", instanceName)
+          .eq("phone_number", phoneNumber)
+          .maybeSingle();
+        if (existingContact) {
+          await admin.from("whatsapp_contacts").update({
+            ...(pushName ? { name: pushName } : {}),
+            last_message_at: new Date().toISOString(),
+          }).eq("id", existingContact.id);
+        } else {
+          await admin.from("whatsapp_contacts").insert({
             user_id: userId,
             instance_name: instanceName,
             remote_jid: remote,
-            is_group: isGroup,
+            is_group: false,
             phone_number: phoneNumber,
             name: pushName,
             last_message_at: new Date().toISOString(),
-          },
-          { onConflict: "user_id,instance_name,phone_number" },
-        );
+          });
+        }
 
         // Save inbound message immediately (for history regardless of automation)
         const messagePayload = {
           user_id: userId,
           phone_number: phoneNumber,
           message_text: text.substring(0, 4000),
-          direction: "inbound",
+          direction: fromMe ? "outbound" : "inbound",
           kind,
           media_url: mediaUrl,
           whatsapp_instance_id: instanceName,
@@ -201,12 +228,15 @@ Deno.serve(async (req) => {
           is_voice_note: kind === "audio" && Boolean(m?.message?.audioMessage?.ptt),
           media_metadata: { remote_jid: remote, message_id: m?.key?.id || null, push_name: pushName },
         };
-        const { data: existingMessage } = await admin.from("messages").select("id").eq("user_id", userId).eq("external_id", m?.key?.id || "").maybeSingle();
+        const { data: existingMessage } = await admin.from("messages").select("id").eq("user_id", userId).eq("whatsapp_instance_id", instanceName).eq("external_id", m?.key?.id || "").maybeSingle();
         if (!existingMessage && m?.key?.id) await admin.from("messages").insert(messagePayload);
-        await saveHistory(userId, phoneNumber, "user", text || `[${kind}]`, { kind, media_url: mediaUrl, external_id: m?.key?.id || null, is_group: isGroup });
+        if (event !== "messagesset" && m?.key?.id) {
+          await saveHistory(userId, phoneNumber, fromMe ? "assistant" : "user", text || `[${kind}]`, { kind, media_url: mediaUrl, external_id: m?.key?.id || null, is_group: false });
+        }
 
-        // Group messages belong to Inbox only. They must never enter the AI pipeline.
-        if (isGroup) continue;
+        // Messages sent directly from the connected phone belong to the Inbox,
+        // but must never trigger another AI response.
+        if (fromMe || event !== "messagesupsert") continue;
 
         if (inst.automation_paused === true) continue;
 

@@ -13,7 +13,7 @@ import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
 
 const db = supabase as any;
-type Contact = { id: string; name: string | null; phone_number: string; should_respond: boolean };
+type Contact = { id: string; name: string | null; phone_number: string; should_respond: boolean; is_group?: boolean };
 type Tag = { id: string; name: string };
 type Stage = { id: string; name: string };
 type Campaign = { id: string; name: string; description: string | null; message_text: string; status: string; scheduled_at: string | null; recipient_count?: number; sent_count?: number; failed_count?: number };
@@ -34,14 +34,17 @@ export default function Campaigns() {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [sending, setSending] = useState("");
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [activeInstance, setActiveInstance] = useState<{ id: string; instance_name: string } | null>(null);
   const completedCount = items.filter((item) => item.status === "completed").length;
   const activeCount = items.filter((item) => ["scheduled", "sending", "processing"].includes(item.status)).length;
 
   const load = async () => {
     if (!user) return;
+    const { data: instance } = await db.from("instances").select("id,instance_name").eq("user_id", user.id).eq("status", "connected").order("created_at", { ascending: false }).limit(1).maybeSingle();
+    setActiveInstance(instance || null);
     const [{ data: campaigns }, { data: contactRows }, { data: tagRows }, { data: stageRows }] = await Promise.all([
       db.from("campaigns").select("id,name,description,message_text,status,scheduled_at").eq("user_id", user.id).order("created_at", { ascending: false }),
-      db.from("whatsapp_contacts").select("id,name,phone_number,should_respond,is_group").eq("user_id", user.id).eq("is_group", false).order("name"),
+      db.from("whatsapp_contacts").select("id,name,phone_number,should_respond,is_group").eq("user_id", user.id).eq("whatsapp_instance_id", instance?.id || "").eq("is_group", false).order("name"),
       db.from("crm_tags").select("id,name").eq("user_id", user.id).order("name"),
       db.from("crm_stages").select("id,name").eq("user_id", user.id).order("position"),
     ]);
@@ -75,12 +78,12 @@ export default function Campaigns() {
 
   const create = async (event: FormEvent) => {
     event.preventDefault();
-    if (!user || !form.name.trim() || !form.message_text.trim()) return;
+    if (!user || !activeInstance || !form.name.trim() || !form.message_text.trim()) return;
     if (!editingId && !audienceContacts.length) return toast({ title: "Público vazio", description: "Selecione pelo menos um contacto elegível.", variant: "destructive" });
     const values = { name: form.name.trim(), description: form.description.trim() || null, message_text: form.message_text.trim(), status: form.scheduled_at ? "scheduled" : "draft", scheduled_at: form.scheduled_at ? new Date(form.scheduled_at).toISOString() : null, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
     const { data: campaign, error } = editingId
       ? await db.from("campaigns").update(values).eq("id", editingId).eq("user_id", user.id).select("id").single()
-      : await db.from("campaigns").insert({ user_id: user.id, ...values }).select("id").single();
+      : await db.from("campaigns").insert({ user_id: user.id, whatsapp_instance_id: activeInstance.id, ...values }).select("id").single();
     if (error || !campaign) return toast({ title: "Não foi possível criar a campanha", description: error?.message, variant: "destructive" });
     if (!editingId) {
       const { error: audienceError } = await db.from("campaign_contacts").insert(audienceContacts.map((contact) => ({ campaign_id: campaign.id, contact_id: contact.id, user_id: user.id })));

@@ -27,16 +27,20 @@ export default function FollowUp() {
   const [selectedContacts, setSelectedContacts] = useState<string[]>([]);
   const [stages, setStages] = useState<Stage[]>([{ delay_minutes: "120", instruction: "", message_template: "", use_ai: true }]);
   const [form, setForm] = useState({ name: "", delay_minutes: "120", max_attempts: "3", ai_instruction: "" });
+  const [activeInstance, setActiveInstance] = useState<{ id: string; instance_name: string } | null>(null);
   const activeRules = rules.filter((rule) => rule.is_active).length;
   const pendingJobs = jobs.filter((job) => job.status === "pending").length;
   const sentJobs = jobs.filter((job) => job.status === "sent").length;
 
   const load = async () => {
     if (!user) return;
+    const { data: instance } = await db.from("instances").select("id,instance_name").eq("user_id", user.id).eq("status", "connected").order("created_at", { ascending: false }).limit(1).maybeSingle();
+    setActiveInstance(instance || null);
+    if (!instance) { setRules([]); setJobs([]); setContacts([]); return; }
     const [{ data: ruleRows }, { data: jobRows }, { data: contacts }] = await Promise.all([
-      db.from("follow_up_rules").select("id,name,delay_minutes,max_attempts,ai_instruction,is_active,created_at").eq("user_id", user.id).order("created_at", { ascending: false }),
-      db.from("follow_up_jobs").select("id,status,attempts,due_at,contact_id").eq("user_id", user.id).order("due_at").limit(100),
-      db.from("whatsapp_contacts").select("id,name,phone_number,is_group").eq("user_id", user.id).eq("is_group", false),
+      db.from("follow_up_rules").select("id,name,delay_minutes,max_attempts,ai_instruction,is_active,created_at").eq("user_id", user.id).eq("whatsapp_instance_id", instance.id).order("created_at", { ascending: false }),
+      db.from("follow_up_jobs").select("id,status,attempts,due_at,contact_id").eq("user_id", user.id).eq("whatsapp_instance_id", instance.id).order("due_at").limit(100),
+      db.from("whatsapp_contacts").select("id,name,phone_number,is_group").eq("user_id", user.id).eq("whatsapp_instance_id", instance.id).eq("is_group", false),
     ]);
     const contactMap = new Map((contacts || []).map((contact: { id: string; name: string | null; phone_number: string }) => [contact.id, contact]));
     setRules(ruleRows || []);
@@ -47,8 +51,8 @@ export default function FollowUp() {
 
   const create = async (event: FormEvent) => {
     event.preventDefault();
-    if (!user) return;
-    const { data: rule, error } = await db.from("follow_up_rules").insert({ user_id: user.id, name: form.name.trim(), delay_minutes: Number(form.delay_minutes), max_attempts: Number(form.max_attempts), ai_instruction: form.ai_instruction.trim() || null, is_active: false }).select("id").single();
+    if (!user || !activeInstance) return;
+    const { data: rule, error } = await db.from("follow_up_rules").insert({ user_id: user.id, whatsapp_instance_id: activeInstance.id, name: form.name.trim(), delay_minutes: Number(form.delay_minutes), max_attempts: Number(form.max_attempts), ai_instruction: form.ai_instruction.trim() || null, is_active: false }).select("id").single();
     if (error || !rule) return toast({ title: "Não foi possível criar a regra", description: error?.message, variant: "destructive" });
     const stageRows = stages.map((stage, position) => ({ rule_id: rule.id, position, delay_minutes: Number(stage.delay_minutes) || 120, instruction: stage.instruction.trim() || null, message_template: stage.message_template.trim() || null, use_ai: stage.use_ai }));
     const stageResult = await db.from("follow_up_stages").insert(stageRows);
